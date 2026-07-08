@@ -1,0 +1,29 @@
+# Copyright Contributors to the Open Cluster Management project
+
+FROM brew.registry.redhat.io/rh-osbs/openshift-golang-builder:rhel_9_1.26 AS builder
+
+WORKDIR /workspace
+
+COPY go.mod go.mod
+COPY go.sum go.sum
+COPY cmd/dynamic-scoring/main.go cmd/main.go
+COPY pkg/ pkg/
+COPY LICENSE LICENSE
+
+RUN CGO_ENABLED=1 GOEXPERIMENT=strictfipsruntime go build -mod=readonly -o dynamic-scoring-addon cmd/main.go
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+
+LABEL url="https://github.com/stolostron/dynamic-scoring-framework" \
+      com.redhat.component="dynamic-scoring-addon-container" \
+      summary="Dynamic Scoring Framework Add-On for Red Hat Advanced Cluster Management" \
+      description="Dynamic Scoring Framework Add-On for Red Hat Advanced Cluster Management" \
+      io.k8s.display-name="Dynamic Scoring Framework Add-On" \
+      io.k8s.description="Dynamic Scoring Framework Add-On for Red Hat Advanced Cluster Management" \
+      io.openshift.tags="acm dynamic-scoring-addon"
+
+WORKDIR /
+COPY --from=builder /workspace/dynamic-scoring-addon /dynamic-scoring-addon
+COPY --from=builder /workspace/LICENSE /licenses/
+
+USER 65532:65532
