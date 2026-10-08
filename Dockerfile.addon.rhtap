@@ -12,7 +12,7 @@ COPY LICENSE LICENSE
 
 RUN CGO_ENABLED=1 GOEXPERIMENT=strictfipsruntime go build -mod=readonly -o dynamic-scoring-addon cmd/main.go
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc:latest
 
 LABEL url="https://github.com/stolostron/dynamic-scoring-framework" \
       com.redhat.component="dynamic-scoring-addon-container" \
