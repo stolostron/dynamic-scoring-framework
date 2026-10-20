@@ -10,56 +10,43 @@ https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html/
 
 ### Push Image to OpenShift Internal Registry
 
+The published controller and addon tags are multi-architecture manifests for
+`linux/amd64` and `linux/arm64`. Version tags are published by the release workflow;
+`latest` is published only from pushes to `main`. Use `skopeo copy --all` to preserve
+both architectures when copying these images to another registry (requires `skopeo`).
+
 ```bash
 # after login to OpenShift hub cluster
 HOST=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
 podman login -u ai-ran-admin -p $(oc whoami -t) $HOST
-# build and push controller image
 IMG_CONTROLLER=$HOST/dynamic-scoring/dynamic-scoring-controller:latest
-make docker-build-controller IMG_CONTROLLER=$IMG_CONTROLLER
-podman push $IMG_CONTROLLER
-# build and push addon image
 IMG_ADDON=$HOST/open-cluster-management/dynamic-scoring-addon:latest
-make docker-build-addon IMG_ADDON=$IMG_ADDON
-podman push $IMG_ADDON
+skopeo copy --all docker://quay.io/open-cluster-management/dynamic-scoring-controller:latest docker://$IMG_CONTROLLER
+skopeo copy --all docker://quay.io/open-cluster-management/dynamic-scoring-addon:latest docker://$IMG_ADDON
 ```
 
-### (Optional) build and push arm64 images from external cluster
+### (Optional) Build and Push Local Changes for Both Architectures
 
-If your environment requires arm64 images, you can build and push them from an external cluster using the following steps.
-(As future work, it planned to support multi-arch builds. this step may not be needed then.)
+With Docker/BuildKit and registry push credentials, build architecture-tagged
+images first, then publish the common manifests. Use the registry image names set
+above, and ensure the destination repositories/ImageStreams exist.
 
 ```bash
-SERVICEACCOUNT=dynamic-scoring-image-pusher
-oc create sa $SERVICEACCOUNT -n open-cluster-management
-oc policy add-role-to-user system:image-pusher -z $SERVICEACCOUNT -n open-cluster-management
-TOKEN=$(oc create token $SERVICEACCOUNT -n open-cluster-management)
-REGISTRY=$(oc get route default-route -n openshift-image-registry --template='{{ .spec.host }}')
-AUTH=$(echo -n "$SERVICEACCOUNT:$TOKEN" | base64 -w0)
-cat <<EOF > ./secrets/push-dockerconfig.json
-{
-	"auths": {
-		"$REGISTRY": {
-			"auth": "$AUTH"
-		}
-	}
-}
-EOF
+oc whoami -t | docker login "$HOST" --username ai-ran-admin --password-stdin
+for ARCH in amd64 arm64; do
+  make image image-push \
+    IMG_CONTROLLER="${IMG_CONTROLLER}-${ARCH}" \
+    IMG_ADDON="${IMG_ADDON}-${ARCH}" \
+    IMAGE_BUILD_EXTRA_FLAGS="--platform linux/${ARCH} --build-arg OS=linux --build-arg ARCH=${ARCH}"
+done
+make image-manifest IMG_CONTROLLER="$IMG_CONTROLLER" IMG_ADDON="$IMG_ADDON"
 ```
 
-```bash
-# before running these commands, make sure you have push secret build-push-secret in managed cluster
-oc create secret generic hub-push-secret \
-  --from-file=.dockerconfigjson=./secrets/push-dockerconfig.json \
-  --type=kubernetes.io/dockerconfigjson -n dynamic-scoring
-oc apply -f hack/image-build/buildconfig-addon-aarch64.yaml -n dynamic-scoring
-# update buildconfig for addon image
-oc start-build addon-aarch64-build -n dynamic-scoring --from-dir=. --follow
-# update buildconfig for policy-watcher image if needed
-oc start-build policy-watcher-aarch64-build -n dynamic-scoring --from-dir=samples/policy-watcher --follow
-```
-
-NOTE: If you want to push images to hub cluster from an external cluster, make sure the external cluster has network access to the hub cluster's internal registry and existence of imagestreams.
+Both `dynamic-scoring-addon-config` and `dynamic-scoring-addon-config-aarch64`
+must use the same common addon image, without an architecture suffix. Their
+existing Placement selectors and config references remain unchanged. Separate
+ARM addon builds from an external cluster are no longer needed. Sample scoring
+API images, including policy-watcher, are not published by the DSF image workflows.
 
 ## Deploy Dynamic Scoring Framework
 
@@ -73,9 +60,28 @@ make deploy-addon IMG_ADDON=$IMG_ADDON
 
 If you push the addon image to the hub cluster's internal registry (e.g. `$HOST/open-cluster-management/dynamic-scoring-addon:latest`), the managed clusters also need credentials to pull it.
 
-As default, this framework copy pull secret named `dynamic-scoring-addon-pull-secret` from namespace `open-cluster-management` on hub cluster to `hub-registry-secret` the agent install namespace (e.g. `dynamic-scoring`).
+The instructions below use the standalone `make deploy-addon` Kustomize manifests, not the Helm chart. The static AddOnDeploymentConfigs reference `hub-registry-secret` by default, so select the Secret name that matches the credential source you use.
 
-### 1) Create pull secret on Hub cluster
+The agent pod's `ImagePullSecrets` must reference a Secret in its install namespace. Choose either the OCM-provided pull credentials or the DSF-specific hub-secret copy below.
+
+### Option 1: Reuse credentials supplied to `clusteradm join`
+
+If each managed cluster was joined with `clusteradm join --image-pull-credential-file=/path/to/docker-config.json`, and that Docker config contains credentials for the DSF image registry, OCM creates `open-cluster-management-image-pull-credentials` in the klusterlet operator namespace on the managed cluster. DSF labels its agent namespace with `addon.open-cluster-management.io/namespace: "true"`, so the klusterlet operator copies this Secret into the agent namespace. You do not need to create the DSF-specific hub Secret in Option 2.
+
+Edit both `AddOnDeploymentConfig` objects referenced by the `ClusterManagementAddOn` and set `ImagePullSecrets` to:
+
+```yaml
+- name: ImagePullSecrets
+  value: '["open-cluster-management-image-pull-credentials"]'
+```
+
+The credential file must authorize pulls from the registry where the DSF agent image is stored. If it is missing or empty, the OCM Secret may not contain credentials that can pull a private image.
+
+### Option 2: Copy a DSF-specific pull Secret from the hub
+
+Use this option when the klusterlet credentials are unavailable or do not have access to the DSF image registry. DSF copies `dynamic-scoring-addon-pull-secret` from `open-cluster-management` on the hub to `hub-registry-secret` in the agent install namespace.
+
+#### 1) Create the DSF pull Secret on the hub cluster
 
 Following are the steps to create the pull secret on hub cluster.
 
@@ -102,9 +108,11 @@ oc create secret generic dynamic-scoring-addon-pull-secret \
   --type=kubernetes.io/dockerconfigjson -n open-cluster-management
 ```
 
-### 2) Update `AddOnDeploymentConfig` to use the secret
+#### 2) Update `AddOnDeploymentConfig` to use the DSF pull Secret
 
-Edit the `AddOnDeploymentConfig` referenced by `ClusterManagementAddOn` (this repo uses `name: dynamic-scoring-addon-config` in namespace `open-cluster-management`).
+Edit both `AddOnDeploymentConfig` objects referenced by `ClusterManagementAddOn`
+(`dynamic-scoring-addon-config` and `dynamic-scoring-addon-config-aarch64` in
+namespace `open-cluster-management`), using the same image and pull secret values.
 
 ```yaml
 apiVersion: addon.open-cluster-management.io/v1alpha1
