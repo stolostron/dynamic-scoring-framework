@@ -176,49 +176,45 @@ You should see a JSON response with computed scores (simple averages of the time
 
 OpenShift's built-in Prometheus (`prometheus-k8s` in `openshift-monitoring`) requires authentication. The Dynamic Scoring Agent needs a bearer token to query it.
 
-The addon framework creates a ServiceAccount (`dynamic-scoring-agent-sa`) on each managed cluster with `cluster-admin` permissions, which covers Prometheus access. However, it does not create a long-lived token Secret for it. We need to create one so the agent can authenticate.
+Use a dedicated ServiceAccount for Prometheus access. Do not grant Prometheus permissions to `dynamic-scoring-agent-sa`: the agent ServiceAccount is for running DSF, and its addon RBAC is scoped to the resources it needs in the addon namespace. The Prometheus reader ServiceAccount is separate; its token is only used as the source bearer credential.
 
-The Secret is **not mounted** into the agent pod — the agent reads it at runtime via the Kubernetes API using the secret name referenced in the DynamicScorer CR (Step 5). The `kubernetes.io/service-account-token` type with the `kubernetes.io/service-account.name` annotation tells Kubernetes to auto-populate the `token` data field with a valid bearer token for that SA.
-
-Deploy the Secret to all managed clusters via ManifestWork from the hub (repeat for each cluster, or loop over them):
+For ACM deployments, the optional sample-scorer Policy should create these resources only on the selected managed clusters when the sample scorer is enabled, and define cleanup when the option is disabled (deleting a Policy alone does not necessarily remove resources it enforced). If that Policy is not being used, apply the following resources directly to each managed cluster where the scorer will run:
 
 ```bash
-for CLUSTER in <MANAGED_CLUSTER_1> <MANAGED_CLUSTER_2>; do
-oc apply -f - <<EOF
-apiVersion: work.open-cluster-management.io/v1
-kind: ManifestWork
+oc apply --context <managed-cluster-context> -f - <<'EOF'
+apiVersion: v1
+kind: ServiceAccount
 metadata:
-  name: dynamic-scoring-agent-token
-  namespace: ${CLUSTER}
-spec:
-  workload:
-    manifests:
-      - apiVersion: v1
-        kind: Secret
-        metadata:
-          name: dynamic-scoring-agent-token
-          namespace: dynamic-scoring
-          annotations:
-            kubernetes.io/service-account.name: dynamic-scoring-agent-sa
-        type: kubernetes.io/service-account-token
-EOF
-done
-```
-
-Alternatively, apply the Secret directly on each managed cluster:
-
-```bash
-oc apply --context <managed-cluster-context> -f - <<EOF
+  name: dynamic-scoring-prometheus-reader
+  namespace: dynamic-scoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dynamic-scoring-prometheus-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-monitoring-view
+subjects:
+  - kind: ServiceAccount
+    name: dynamic-scoring-prometheus-reader
+    namespace: dynamic-scoring
+---
 apiVersion: v1
 kind: Secret
 metadata:
   name: dynamic-scoring-agent-token
   namespace: dynamic-scoring
   annotations:
-    kubernetes.io/service-account.name: dynamic-scoring-agent-sa
+    kubernetes.io/service-account.name: dynamic-scoring-prometheus-reader
 type: kubernetes.io/service-account-token
 EOF
 ```
+
+The `cluster-monitoring-view` ClusterRole grants the reader ServiceAccount the OpenShift monitoring access needed for Prometheus queries. The token Secret is **not mounted** into the agent pod: the agent reads it from the `dynamic-scoring` namespace using the Secret name referenced in the `DynamicScorer` (Step 5), then sends its `token` value as a bearer token. Kubernetes populates that value because the Secret is annotated with the reader ServiceAccount's name.
+
+This is a long-lived ServiceAccount token. If `dynamic-scoring-agent-token` already exists and is associated with `dynamic-scoring-agent-sa`, replace it with the Secret above so the token is issued for `dynamic-scoring-prometheus-reader`.
 
 ## 5. Register the Scorer (DynamicScorer CR)
 
@@ -279,7 +275,7 @@ Key fields:
 - **`configURL`** — the Route URL of the scorer's `/config` endpoint
 - **`configSyncMode: None`** — all config is defined in this CR (use `Full` if you want the controller to fetch config from the scorer's `/config` endpoint instead)
 - **`source.host`** — OpenShift's built-in Prometheus endpoint (port 9091, HTTPS)
-- **`source.auth.tokenSecretRef`** — references the token Secret created in Step 4
+- **`source.auth.tokenSecretRef`** — references the token Secret created in Step 4. The Secret supplies the credential; the reader ServiceAccount's `cluster-monitoring-view` binding authorizes it.
 - **`scoring.host`** — the Route URL of the scorer (agents on all managed clusters POST here)
 - **`scoring.params.name`** — the score name used in `AddOnPlacementScore` and Prometheus metrics
 
@@ -363,7 +359,7 @@ The `name` field follows the `scoreDimensionFormat` from the DynamicScorer (`${s
 
 **Symptom:** Agent logs show 401/403 errors when querying Prometheus.
 
-**Fix:** Ensure the token Secret exists in the `dynamic-scoring` namespace on the managed cluster and is annotated with the correct ServiceAccount name (`dynamic-scoring-agent-sa`). The ServiceAccount must have permission to query Prometheus — on OpenShift, `cluster-admin` binding (created by the addon) covers this.
+**Fix:** Ensure the token Secret exists in the `dynamic-scoring` namespace on the managed cluster, is populated with a `token`, and is annotated for `dynamic-scoring-prometheus-reader`. Verify that the `dynamic-scoring-prometheus-reader` ServiceAccount is bound to the `cluster-monitoring-view` ClusterRole. The token authenticates the request; the binding grants authorization.
 
 ## Next Steps
 
